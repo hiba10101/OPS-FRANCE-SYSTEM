@@ -1,0 +1,227 @@
+import { useState, useCallback } from "react";
+import * as XLSX from "xlsx";
+
+const C = {
+  ok:"#16a34a", okBg:"#f0fdf4",
+  bad:"#dc2626", badBg:"#fef2f2",
+  mid:"#d97706", midBg:"#fffbeb",
+  navy:"#1e3a5f", navyLight:"#2d5fa0",
+  gray:"#6b7280", grayLight:"#f9fafb", border:"#e5e7eb",
+};
+
+const GROUPS = { "78+92":["78","92"], "91+95":["91","95"], "77":["77"] };
+const GROUP_COLORS = {
+  "78+92": { bg:"#EFF6FF", hdr:"#BFDBFE", text:"#1e40af" },
+  "91+95": { bg:"#F0FDF4", hdr:"#BBF7D0", text:"#166534" },
+  "77":    { bg:"#FFFBEB", hdr:"#FDE68A", text:"#92400e" },
+};
+
+function getGroup(cp) {
+  const d = String(cp).slice(0,2);
+  for (const [g, depts] of Object.entries(GROUPS)) if (depts.includes(d)) return g;
+  return "Autre";
+}
+function parseTime(s) { const p=String(s).trim().split(":"); return parseInt(p[0])*60+parseInt(p[1]); }
+function computeRow(heure, tranche) {
+  try {
+    if (!heure||!tranche||!String(tranche).includes(" a ")) return {onTime:null,delayMin:0};
+    const actual=parseTime(String(heure)), end=parseTime(String(tranche).split(" a ")[1].trim());
+    const onTime=actual<=end;
+    return {onTime, delayMin:onTime?0:Math.max(0,actual-end)};
+  } catch { return {onTime:null,delayMin:0}; }
+}
+function formatDate(val) {
+  if (!val) return "";
+  if (typeof val==="number") { const d=XLSX.SSF.parse_date_code(val); return `${String(d.d).padStart(2,"0")}/${String(d.m).padStart(2,"0")}/${d.y}`; }
+  if (val instanceof Date) return `${String(val.getDate()).padStart(2,"0")}/${String(val.getMonth()+1).padStart(2,"0")}/${val.getFullYear()}`;
+  return String(val).slice(0,10);
+}
+
+function processFile(wb) {
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, {defval:""});
+  const keys = Object.keys(rows[0]);
+  const refKey   = keys.find(k=>k.toLowerCase().includes("f")&&k.toLowerCase().includes("rence"));
+  const dateKey  = keys.find(k=>k.toLowerCase()==="date");
+  const cpKey    = keys.find(k=>k.toLowerCase().includes("postal")&&k.toLowerCase().includes("livr"));
+  const villeKey = keys.find(k=>k.toLowerCase().includes("ville")&&k.toLowerCase().includes("livr"));
+
+  const enriched = rows.map(r => {
+    const {onTime,delayMin} = computeRow(r["Heure"],r["TRANCHE HORAIRE"]);
+    const cp = String(r[cpKey]||"");
+    return { ref:r[refKey], date:formatDate(r[dateKey]), cp, ville:String(r[villeKey]||""),
+             group:getGroup(cp), onTime, delayMin };
+  }).filter(r=>r.onTime!==null&&r.date);
+
+  const orderMap={}, groupMap={};
+  enriched.forEach(({ref,date,cp,ville,group,onTime,delayMin})=>{
+    const ok = `${date}|||${ref}`;
+    if (!orderMap[ok]) orderMap[ok]={date,ref,cp,ville,group,total:0,ok:0,fuera:0,r30:0};
+    orderMap[ok].total++;
+    if (onTime) orderMap[ok].ok++; else { orderMap[ok].fuera++; if(delayMin>30) orderMap[ok].r30++; }
+
+    const gk = `${date}|||${group}`;
+    if (!groupMap[gk]) groupMap[gk]={date,group,colis:0,ok:0,fuera:0,r30:0,refs:new Set()};
+    groupMap[gk].colis++; groupMap[gk].refs.add(ref);
+    if (onTime) groupMap[gk].ok++; else { groupMap[gk].fuera++; if(delayMin>30) groupMap[gk].r30++; }
+  });
+
+  const orders = Object.values(orderMap).map(r=>({...r,taux:Math.round(r.ok/r.total*1000)/10}));
+  const groups = Object.values(groupMap).map(r=>({...r,commandes:r.refs.size,taux:Math.round(r.ok/r.colis*1000)/10}));
+  const byDate={};
+  orders.forEach(r=>{ if(!byDate[r.date]) byDate[r.date]={orders:[],groups:{}}; byDate[r.date].orders.push(r); });
+  groups.forEach(r=>{ if(byDate[r.date]) byDate[r.date].groups[r.group]=r; });
+  return {byDate, allOrders:orders};
+}
+
+function exportXLSX(byDate) {
+  const wb2=XLSX.utils.book_new();
+  const data=[["Date","Référence","CP","Ville","Colis","En horario","Fuera","Taux (%)","Retard > 30 min"]];
+  Object.entries(byDate).sort(([a],[b])=>a.localeCompare(b)).forEach(([date,{orders,groups}])=>{
+    orders.forEach(r=>data.push([r.date,r.ref,r.cp,r.ville,r.total,r.ok,r.fuera,r.taux,r.r30]));
+    const t=orders.reduce((a,r)=>({tot:a.tot+r.total,ok:a.ok+r.ok,fuera:a.fuera+r.fuera,r30:a.r30+r.r30}),{tot:0,ok:0,fuera:0,r30:0});
+    data.push([`TOTAL ${date} (${orders.length} commandes)`,"","","",t.tot,t.ok,t.fuera,Math.round(t.ok/t.tot*1000)/10,t.r30]);
+    ["78+92","91+95","77"].forEach(g=>{ const gd=groups[g]; if(gd) data.push([`  ↳ Dép. ${g}`,"","",`${gd.commandes} cmd`,gd.colis,gd.ok,gd.fuera,gd.taux,gd.r30]); });
+    data.push([]);
+  });
+  const ws2=XLSX.utils.aoa_to_sheet(data);
+  ws2["!cols"]=[14,16,10,22,10,12,10,12,14].map(w=>({wch:w}));
+  XLSX.utils.book_append_sheet(wb2,ws2,"Résumé retards");
+  XLSX.writeFile(wb2,"tracking_résumé.xlsx");
+}
+
+export default function App() {
+  const [state,setState]=useState("idle");
+  const [result,setResult]=useState(null);
+  const [filename,setFilename]=useState("");
+  const [dragOver,setDragOver]=useState(false);
+
+  const handle=useCallback((file)=>{
+    if (!file) return;
+    setFilename(file.name); setState("processing");
+    const reader=new FileReader();
+    reader.onload=(e)=>{
+      try { const wb=XLSX.read(e.target.result,{type:"array",cellDates:true}); setResult(processFile(wb)); setState("done"); }
+      catch { setState("error"); }
+    };
+    reader.readAsArrayBuffer(file);
+  },[]);
+
+  const onDrop=useCallback((e)=>{ e.preventDefault(); setDragOver(false); const f=e.dataTransfer.files[0]; if(f) handle(f); },[handle]);
+  const totals=result?result.allOrders.reduce((a,r)=>({cmd:a.cmd+1,tot:a.tot+r.total,ok:a.ok+r.ok,fuera:a.fuera+r.fuera,r30:a.r30+r.r30}),{cmd:0,tot:0,ok:0,fuera:0,r30:0}):null;
+
+  return (
+    <div style={{fontFamily:"'DM Sans','Segoe UI',sans-serif",minHeight:"100vh",background:"#f8fafc",padding:"1.5rem"}}>
+
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1.5rem"}}>
+        <div>
+          <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.1em",color:C.navyLight,textTransform:"uppercase",marginBottom:3}}>Refruiting</div>
+          <h1 style={{fontSize:20,fontWeight:700,color:C.navy,margin:0}}>Suivi des livraisons</h1>
+        </div>
+        {state==="done"&&<button onClick={()=>exportXLSX(result.byDate)} style={{background:C.navyLight,color:"#fff",border:"none",borderRadius:8,padding:"8px 18px",fontWeight:600,fontSize:13,cursor:"pointer"}}>↓ Exporter Excel</button>}
+      </div>
+
+      <div onDrop={onDrop} onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onClick={()=>document.getElementById("fi").click()}
+        style={{border:`2px dashed ${dragOver?C.navyLight:C.border}`,borderRadius:12,padding:"1.25rem",textAlign:"center",cursor:"pointer",background:dragOver?"#eff6ff":"#fff",marginBottom:"1.5rem",transition:"all 0.15s"}}>
+        <input id="fi" type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handle(e.target.files[0])}/>
+        <div style={{fontSize:24,marginBottom:6}}>📂</div>
+        {state==="idle"&&<div style={{color:C.gray,fontSize:13}}>Dépose ton fichier tracking (.xlsx) ou clique pour sélectionner</div>}
+        {state==="processing"&&<div style={{color:C.navyLight,fontSize:13,fontWeight:600}}>Traitement en cours…</div>}
+        {state==="done"&&<div style={{color:C.ok,fontSize:13,fontWeight:600}}>✓ {filename} — Clique pour changer de fichier</div>}
+        {state==="error"&&<div style={{color:C.bad,fontSize:13}}>Erreur — vérifie que c'est un fichier tracking valide.</div>}
+      </div>
+
+      {totals&&(
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:"1.5rem"}}>
+          {[{label:"Commandes",value:totals.cmd,color:C.navy},{label:"Colis total",value:totals.tot,color:C.navy},
+            {label:"En horario",value:totals.ok,color:C.ok},{label:"Fuera",value:totals.fuera,color:C.bad},
+            {label:"Retard > 30 min",value:totals.r30,color:C.mid}].map(({label,value,color})=>(
+            <div key={label} style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:10,padding:"0.85rem 1rem"}}>
+              <div style={{fontSize:11,color:C.gray,marginBottom:3,fontWeight:500}}>{label}</div>
+              <div style={{fontSize:22,fontWeight:700,color}}>{value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {result&&Object.entries(result.byDate).sort(([a],[b])=>a.localeCompare(b)).map(([date,{orders,groups}])=>{
+        const tot=orders.reduce((a,r)=>({tot:a.tot+r.total,ok:a.ok+r.ok,fuera:a.fuera+r.fuera,r30:a.r30+r.r30}),{tot:0,ok:0,fuera:0,r30:0});
+        const taux=Math.round(tot.ok/tot.tot*1000)/10;
+        const tc=taux===100?C.ok:taux<50?C.bad:C.mid;
+
+        return (
+          <div key={date} style={{marginBottom:"1.5rem"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+              <div style={{fontSize:13,fontWeight:700,color:C.navy}}>📅 {date}</div>
+              <div style={{fontSize:12,color:C.gray}}>{orders.length} commandes</div>
+              <div style={{marginLeft:"auto",fontSize:12,fontWeight:600,color:tc}}>Taux global : {taux}%</div>
+            </div>
+
+            <div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:10,overflow:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+                <thead>
+                  <tr style={{background:C.navy,color:"#fff"}}>
+                    {["Référence","CP","Ville livraison","Colis","En horario","Fuera","Taux","Retard > 30 min"].map((h,i)=>(
+                      <th key={h} style={{padding:"9px 12px",textAlign:i<3?"left":"center",fontWeight:600,fontSize:12,whiteSpace:"nowrap"}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {orders.map((r,i)=>{
+                    const type=r.taux===100?"ok":r.taux<50?"bad":"mid";
+                    const bg={ok:i%2===0?"#fff":C.grayLight,bad:C.badBg,mid:C.midBg}[type];
+                    return (
+                      <tr key={r.ref} style={{background:bg,borderTop:`1px solid ${C.border}`}}>
+                        <td style={{padding:"7px 12px",fontWeight:600,color:C.navy}}>{r.ref}</td>
+                        <td style={{padding:"7px 12px"}}>
+                          <span style={{background:"#f1f5f9",color:C.navy,borderRadius:4,padding:"2px 7px",fontSize:12,fontWeight:600}}>{r.cp}</span>
+                        </td>
+                        <td style={{padding:"7px 12px",color:C.gray,fontSize:12}}>{r.ville}</td>
+                        <td style={{padding:"7px 12px",textAlign:"center",color:C.gray}}>{r.total}</td>
+                        <td style={{padding:"7px 12px",textAlign:"center",fontWeight:600,color:C.ok}}>{r.ok}</td>
+                        <td style={{padding:"7px 12px",textAlign:"center",fontWeight:600,color:r.fuera>0?C.bad:C.gray}}>{r.fuera||"—"}</td>
+                        <td style={{padding:"7px 12px",textAlign:"center",fontWeight:700,color:{ok:C.ok,bad:C.bad,mid:C.mid}[type]}}>{r.taux}%</td>
+                        <td style={{padding:"7px 12px",textAlign:"center",fontWeight:700,color:r.r30>0?C.bad:C.gray}}>{r.r30>0?`⚠ ${r.r30}`:"—"}</td>
+                      </tr>
+                    );
+                  })}
+
+                  {/* Day total */}
+                  <tr style={{background:"#dbeafe",borderTop:`2px solid #93c5fd`}}>
+                    <td style={{padding:"8px 12px",fontWeight:700,color:C.navy}} colSpan={3}>Total {date} — {orders.length} commandes</td>
+                    <td style={{padding:"8px 12px",textAlign:"center",fontWeight:700}}>{tot.tot}</td>
+                    <td style={{padding:"8px 12px",textAlign:"center",fontWeight:700,color:C.ok}}>{tot.ok}</td>
+                    <td style={{padding:"8px 12px",textAlign:"center",fontWeight:700,color:tot.fuera>0?C.bad:C.gray}}>{tot.fuera||"—"}</td>
+                    <td style={{padding:"8px 12px",textAlign:"center",fontWeight:700,color:tc}}>{taux}%</td>
+                    <td style={{padding:"8px 12px",textAlign:"center",fontWeight:700,color:tot.r30>0?C.bad:C.gray}}>{tot.r30>0?`⚠ ${tot.r30}`:"—"}</td>
+                  </tr>
+
+                  {/* Group breakdown */}
+                  {["78+92","91+95","77"].map(g=>{
+                    const gd=groups[g]; if(!gd) return null;
+                    const gc=GROUP_COLORS[g];
+                    const gtaux=gd.taux; const gtc=gtaux===100?C.ok:gtaux<50?C.bad:C.mid;
+                    return (
+                      <tr key={g} style={{background:gc.bg,borderTop:`1px solid ${C.border}`}}>
+                        <td style={{padding:"6px 12px 6px 20px"}} colSpan={2}>
+                          <span style={{background:gc.hdr,color:gc.text,borderRadius:4,padding:"2px 10px",fontSize:12,fontWeight:700}}>Dép. {g}</span>
+                          <span style={{marginLeft:8,fontSize:12,color:C.gray}}>{gd.commandes} commandes</span>
+                        </td>
+                        <td style={{padding:"6px 12px",fontSize:12,color:C.gray}}></td>
+                        <td style={{padding:"6px 12px",textAlign:"center",fontSize:12,fontWeight:600,color:C.gray}}>{gd.colis}</td>
+                        <td style={{padding:"6px 12px",textAlign:"center",fontSize:12,fontWeight:600,color:C.ok}}>{gd.ok}</td>
+                        <td style={{padding:"6px 12px",textAlign:"center",fontSize:12,fontWeight:600,color:gd.fuera>0?C.bad:C.gray}}>{gd.fuera||"—"}</td>
+                        <td style={{padding:"6px 12px",textAlign:"center",fontSize:12,fontWeight:700,color:gtc}}>{gd.taux}%</td>
+                        <td style={{padding:"6px 12px",textAlign:"center",fontSize:12,fontWeight:700,color:gd.r30>0?C.bad:C.gray}}>{gd.r30>0?`⚠ ${gd.r30}`:"—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
